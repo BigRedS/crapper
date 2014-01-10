@@ -1,0 +1,398 @@
+#! /usr/bin/perl
+
+use strict;
+use 5.010;
+
+use Getopt::Long;
+use Sys::Syslog qw(:standard :macros); 
+
+use constant LOCKFILE_DIRECTORY  => "/var/lock";
+use constant REGISTERED_JOBS_DIR => $ENV{'CRAPPER_REGISTERED_JOBS_DIR'} || "/etc/crapper";
+
+openlog("crapper", "pid", "cron");
+
+# Parse and sort out command line options:
+# Every invocatio needs a -u
+my $cf = {};
+$cf->{'lockfile_dir'} = LOCKFILE_DIRECTORY;
+$cf->{'stderr'} = 1;
+GetOptions(
+	'name|n=s'        => \$cf->{'name'},
+	'cmd|command|c=s' => \$cf->{'cmd'},
+	'debug'           => \$cf->{'debug'},
+	'verbose|v'       => \$cf->{'verbose'},
+	'deregister'      => \$cf->{'deregister'},
+  'dryrun|dry-run'  => \$cf->{'dryrun'},
+	'time'            => \$cf->{'time'},
+	'lockdir=s'       => \$cf->{'lockfile_dir'},
+	'nice:i'          => \$cf->{'nice'},
+	'help|h'          => \$cf->{'help'},
+	'ionice:i'        => \$cf->{'ionice'},
+	'preflight|p=s'   => \$cf->{'preflight'},
+	'stdout:s'        => \$cf->{'stdout'},
+	'r|register'      => \$cf->{'register'},
+	'L|lock'          => \$cf->{'lock'},
+	'U|unlock'        => \$cf->{'unlock'},
+) or die ("Problematic arguments");
+
+if($cf->{'help'}){
+	print usage();
+	exit;
+}
+
+_error("Name not set (use --name)") unless $cf->{'name'};
+my $NAME = $cf->{'name'};
+
+# Actually, let's not do this. 0 is a reasonable
+# default for either.
+## Deal with default nice and ionice values:
+#if(0 == $cf->{'nice'}){
+#	$cf->{'nice'} = undef;
+#}
+#if(0 == $cf->{'ionice'}){
+#	$cf->{'ionice'} = undef;
+#}
+
+
+# Get a lockfile path:
+my $f_lock = makeLockFilePath($cf);
+_log("Starting");
+
+#Some switches don't cause a command to be executed, we deal with those first:
+
+# Manual unlock:
+if($cf->{'unlock'}){
+	_log("Manually unlocking");
+	unlockFile($f_lock) && quit("Unlocked");
+	print "Failed: $!";
+	exit 255;
+}
+
+# Manual lock (why?)
+if($cf->{'lock'}){
+	_log("Manually locking '$f_lock'");
+	lockFile($f_lock, $$) && quit("Locked");
+	print "Failed: $!";
+	exit 255;
+}
+
+# Allow users to 'deregister' a command (and carry on to register the 
+# new one.
+if($cf->{'deregister'}){
+	_debug("Unlocking prior to deregistering");
+	unlockFile($f_lock);
+	_log("Deregistering");
+	deregisterJob($cf) && _log("Deregistered");
+}
+
+
+
+# We also want to make sure we're running a job we're supposed to be:
+my $registeredCommand = jobIsRegistered($cf);
+
+if($registeredCommand eq ""){
+	if($cf->{'cmd'} =~ /.+/){
+		_debug("Job not seen before; registering");
+		registerJob($cf) or die ("Error registering job");
+		$registeredCommand = jobIsRegistered($cf);
+	}else{
+		_error("Unknown job '$cf->{'name'}; I need a command to run");
+	}
+}else{
+	if($cf->{'cmd'} eq ""){
+		_debug("Job already registered with name '$cf->{'name'}'; carrying on");
+	}elsif($cf->{'cmd'} eq $registeredCommand){
+		_debug ("Job already registered as '$registeredCommand', carrying on.");
+	}else{
+		_error("Registered command has changed, $cf->{'name'} should be \n$registeredCommand\n but I found \n$cf->{'cmd'}\n");
+	}
+}
+
+_error("Command is empty") if $registeredCommand eq "";
+
+# We should by now have exited unless we wish to run the command:
+# Add ionice and nice:
+my $command = $registeredCommand;
+if($cf->{'ionice'}){
+	_debug("ionice: $cf->{'ionice'}");
+	$command = "ionice -c".$cf->{'ionice'}." $command";
+}
+if($cf->{'nice'}){
+	_debug("nice: $cf->{'nice'}");
+	$command = "nice -n".$cf->{'nice'}." $command";
+}
+
+
+lockFile($f_lock, $$) or _error("Failed to acquire lock : $!");
+_debug("Locked file $f_lock");
+
+# Run a preflight check. This should be made more sophisticated:
+if($cf->{'preflight'}){
+	_log("Running preflight check: $cf->{'preflight'}");
+	my @output = qw/$cf->{'preflight'}/;
+	my $retval = shift;
+	$retval+=0;
+	if($cf->{'stdout'} > 0){
+		print join("\n", @output);
+	}
+	if($retval > 0){
+		_quit("Preflight check exited $retval; not continuing");
+	}else{
+		_log("Preflight check exited $retval; carring on");
+	}
+}
+
+# Run the command
+unless($cf->{'dryrun'}){
+	_log("Running command: $command");
+	my $start = time();
+	my @output = qx/$command/;
+	my $duration = time() - $start;
+	my $retval = $?;
+	_log("command exited $?, took $duration seconds and produced",  $#output+1, "lines of output");
+	use Data::Dumper;
+	if(exists($cf->{'stdout'})){
+		if($cf->{'stdout'} eq ""){
+			my $output = join("", @output);
+			_log("Printing", length($output), "bytes to stdout");
+			print STDOUT join("", @output);
+		}elsif($cf->{'stdout'} =~ /.+/){
+			_log("Printing", $#output. "lines of stdout to '$cf->{'stdout'}'");
+			open(my $fh, ">", $cf->{'stdout'}) or _error("Failed to open stdout file '$cf->{'stdout'} for writing : $!");
+			print $fh @output;
+			close($fh);
+		}
+	}
+}else{
+	_warn("Running with --dry-run; not running anything");
+}
+_debug("unlocking");
+unlockFile($f_lock) or _error("Failed to release lock :$!");
+
+exit 0;
+
+# # # #
+# # #
+# #
+#
+
+# Checks if a job has been registered by a given name already. 
+# returns the registered command.
+sub jobIsRegistered{
+	my $cf = shift;
+	my $f_registration = REGISTERED_JOBS_DIR."/".$cf->{'name'};
+	_debug("Registration file : $f_registration");
+	if (-f $f_registration){
+		open(my $fh_registration, "<", $f_registration) or _error ("Couldn't open registration file '$f_registration' :$!");
+		my $command = readline($fh_registration);
+		close($fh_registration);
+		chomp($command);
+		return $command;
+	}else{
+		return undef;
+	}
+}
+
+# Registers a job by creating a file and putting the command
+# in it. Does no validation.
+sub registerJob{
+	my $cf = shift;
+	my $f_registration = REGISTERED_JOBS_DIR."/".$cf->{'name'};
+	_debug("Registering job in '$f_registration'");
+	open(my $fh_registration, ">", $f_registration) or die ("Error opening file '$f_registration' for writing : $!");
+	print $fh_registration $cf->{'cmd'};
+	close($fh_registration);
+}
+
+sub deregisterJob{
+	my $cf = shift;
+	my $f_registration = REGISTERED_JOBS_DIR."/".$cf->{'name'};
+	if(-f $f_registration){
+		_debug ("Deregistering job; deleting '$f_registration'");
+		unlink($f_registration) && return 1;
+		_warn ("Failed :$!");
+		return;
+	}else{
+		_error ("Job not registered");
+	}
+}
+
+# Deletes a lockfile
+sub unlockFile(){
+	my $f_lock = shift;
+	if(-f $f_lock){
+		if(unlink($f_lock)){
+			_log("Removed lockFile '$f_lock'");
+			return 1;
+		}else{
+			_error("Failed to remove lockfie '$f_lock': $!");
+			return undef;
+		}
+	}else{
+		_debug("lockFile '$f_lock' does not exist");
+		return 1
+	}
+}
+
+# Creates a lockfile
+sub lockFile{
+	my $f_lock = shift;
+	my $pid = shift;
+	if(-f $f_lock){
+		my $fh_lock;
+		eval{
+			open($fh_lock, "<", $f_lock) or die($!);
+		};
+		if($@){
+			_error("lockFile exsts. Aborting. (also, I couldn't open the lockFile for reading : $@)");
+		}
+		my $oldPid = readline($fh_lock);
+		close($fh_lock) if($fh_lock);
+		if($oldPid =~ m/^\s*(\d+)\s*$/){
+			_log("lockFile '$f_lock' exists");
+			_error("lockFile '$f_lock' exists (contains pid '$oldPid')");
+		}else{
+			_error("lockFile '$f_lock' exists but contains something that's not a pid ('$pid')\n");
+		}
+	}
+	# By now we're happy that there isn't already a lockFile.
+	open(my $fh_lock, ">", $f_lock) or die ("Error opening lockFile '$f_lock' for writing: $!");
+	print $fh_lock $pid or die ("Error writing PID ('$pid') to lockFile ('$f_lock'): $!");
+	close($fh_lock) or die("Error closing filehandle on lockFile '$f_lock': $!");
+	return 1;
+}
+
+# Concocts the path to a lockfile
+sub makeLockFilePath{
+	my $cf = shift;
+	my $d_lock = $cf->{'lockfile_dir'};
+	$f_lock = $d_lock."/".$cf->{'name'};
+	$f_lock =~ s#//#/#g;
+	return $f_lock;
+}
+
+
+sub _log{
+	my $message = join(" ", @_);
+	syslog("info", "[$NAME] $message");
+	print STDERR $message."\n" if $cf->{'verbose'};
+}
+
+sub _warn{
+	my $message = join(" ", @_);
+ 	_log("WARN:  $message");
+}
+
+sub _error{
+	my $message = join(" ", @_);
+	_log("ERROR: $message");
+	exit 1;
+}
+
+
+sub _debug{
+	return unless $cf->{'debug'};
+	my $message = join(" ", @_), "\n";
+	_log("DEBUG: $message");
+}
+
+# A sucessful exit.
+sub quit{
+	my $message = join(" ", @_);
+	if($message =~ /.+/){
+		_log("Quitting: $message")
+	}else{
+		_log ("Quitting");
+	}
+	exit;
+}
+
+sub usage{
+
+return <<'EOF'
+crapper - a poorly-named cron wrapper.
+
+Usage:
+
+   crapper [options] -c <command> -n <name>
+
+Options:
+
+  -n <name>           Specify the name for this job
+  -c <command>        Command to execute
+  -d --debug          Turn on debugging (log moreverbosely)
+  -d --deregister     Forget the named command
+	-d --dry-run        Do everything except execute the command
+     --lockdir <dir>  Specify a directory for the lockfiles
+     --nice <num>     Set the niceness to num
+	   --ionice <num>   Set the ioniceness to num
+	-h --help           Show this hekp
+	   --stdout (file)  Preserve stdout; optionally print to <file>
+	-L --lock           Create a lockfile for this job ('lock' it)
+	-U --unlock         Manually unlock the job
+	-v --verbose        Print all log lines to STDERR
+
+Crapper was written to solve two problems:
+
+* Job stacking
+
+To prevent multiple overlapping runs of the same job crapper will
+create a lockfile for each job. These files are given a name which 
+matches that given to the job itself. To prevent inadvertent re-use
+of names (and an attempted sharing of a lockfile path), each name is
+'registered' on first use by creating a file containing the command. 
+Executions will fail if they are passed without a name or with a name 
+that's already registered with a differing command (crapper's other
+arguments may be changed without re-registration)
+
+The --deregister option may be used to remove this file (and so forget
+the job existed) which will be necessary on the first run after 
+modifying a job. It does not prevent the eventual execution of the 
+job; you can pass this option in the crontab if you wish to circumvent
+this registration process. 
+
+* Logging & stdout/stderr
+
+Cron is quite poor at logging what's going on; crapper logs its own
+operations quite verbosely, and currently only a few more details about
+the job itself than does normal cron. 
+
+Crapper also, by default, discards text printed to stdout and leaves
+stderr be; you can have stdout left alone by passing --stdout, or 
+have it printed to a file by giving --stdout an argument.
+
+* Precise timing
+
+Yeah, that's to come.
+
+Some examples:
+
+
+Restart some daemon nightly with stderr emailed, with nothing emailed and
+with both emailed:
+
+ crapper -c "/etc/init.d/mydaemon restart" --name daemonrestart"
+ crapper -c "/etc/init.d/mydaemon restart 2>&1" --name daemonrestart"
+ crapper -c "/etc/init.d/mydaemon restart" --name daemonrestart" --stdout
+
+Create a lockfile to prevent its execution:
+
+ crapper -n daemonrestart --lock
+
+Forget the above job:
+
+   crapper -n daemonrestart --deregister
+
+Create a new one
+
+
+
+
+EOF
+}
+
+
+
+
+
+
