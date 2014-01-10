@@ -1,0 +1,58 @@
+Crapper is a poorly-named cron wrapper.
+
+Crapper was written to solve three problems:
+
+* Job stacking
+
+To prevent multiple overlapping runs of the same job crapper will
+create a lockfile for each job. These files are given a name which 
+matches that given to the job itself. To prevent inadvertent re-use
+of names (and an attempted sharing of a lockfile path), each name is
+'registered' on first use by creating a file containing the command. 
+Executions will fail if they are passed without a name or with a name 
+that's already registered with a differing command (crapper's other
+arguments may be changed without re-registration)
+
+The --deregister option may be used to remove this file (and so forget
+the job existed) which will be necessary on the first run after 
+modifying a job. It does not prevent the eventual execution of the 
+job; you can pass this option in the crontab if you wish to circumvent
+this registration process. 
+
+* Logging & stdout/stderr
+
+Cron is quite poor at logging what's going on; crapper logs its own
+operations quite verbosely, and currently only a few more details about
+the job itself than does normal cron. 
+
+Crapper also, by default, discards text printed to stdout and leaves
+stderr be; you can have stdout left alone by passing --stdout, or 
+have it printed to a file by giving --stdout an argument.
+
+* Conditional running
+
+Sometimes you only want to run one command if another exits sucessfully; 
+resulting in commands chained together with &&s; if the --preflight 
+switch is set, crapper will only run if its argument returns true.
+
+
+Some examples:
+
+Restart some daemon nightly with stderr emailed, with nothing emailed and
+with both emailed:
+
+ crapper -c "/etc/init.d/mydaemon restart" --name daemonrestart
+ crapper -c "/etc/init.d/mydaemon restart 2>&1" --name daemonrestart
+ crapper -c "/etc/init.d/mydaemon restart" --name daemonrestart --stdout
+
+Once it's run once (and registered) you need no longer supply the command:
+
+ crapper --name daemonrestart
+
+You might only wish to restart it if it's already running:
+
+ crapper --preflight "pgrep daemon" --name daemonrestart
+
+Or do it awfully slowly:
+
+ crapper --nice 19 --ionice 3 --name daemonrestart --preflight "pgrep daemon"

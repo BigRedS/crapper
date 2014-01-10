@@ -332,7 +332,7 @@ Options:
 	-U --unlock         Manually unlock the job
 	-v --verbose        Print all log lines to STDERR
 
-Crapper was written to solve two problems:
+Crapper was written to solve three problems:
 
 * Job stacking
 
@@ -361,32 +361,33 @@ Crapper also, by default, discards text printed to stdout and leaves
 stderr be; you can have stdout left alone by passing --stdout, or 
 have it printed to a file by giving --stdout an argument.
 
-* Precise timing
+* Conditional running
 
-Yeah, that's to come.
+Sometimes you only want to run one command if another exits sucessfully; 
+resulting in commands chained together with &&s; if the --preflight 
+switch is set, crapper will only run if its argument returns true.
+
 
 Some examples:
-
 
 Restart some daemon nightly with stderr emailed, with nothing emailed and
 with both emailed:
 
- crapper -c "/etc/init.d/mydaemon restart" --name daemonrestart"
- crapper -c "/etc/init.d/mydaemon restart 2>&1" --name daemonrestart"
- crapper -c "/etc/init.d/mydaemon restart" --name daemonrestart" --stdout
+ crapper -c "/etc/init.d/mydaemon restart" --name daemonrestart
+ crapper -c "/etc/init.d/mydaemon restart 2>&1" --name daemonrestart
+ crapper -c "/etc/init.d/mydaemon restart" --name daemonrestart --stdout
 
-Create a lockfile to prevent its execution:
+Once it's run once (and registered) you need no longer supply the command:
 
- crapper -n daemonrestart --lock
+ crapper --name daemonrestart
 
-Forget the above job:
+You might only wish to restart it if it's already running:
 
-   crapper -n daemonrestart --deregister
+ crapper --preflight "pgrep daemon" --name daemonrestart
 
-Create a new one
+Or do it awfully slowly:
 
-
-
+ crapper --nice 19 --ionice 3 --name daemonrestart --preflight "pgrep daemon"
 
 EOF
 }
